@@ -1,6 +1,6 @@
 import frappe
 from frappe import _
-from erpnext.payroll.doctype.payroll_entry.payroll_entry import PayrollEntry
+from hrms.payroll.doctype.payroll_entry.payroll_entry import PayrollEntry
 from erpnext.accounts.doctype.accounting_dimension.accounting_dimension import (
     get_accounting_dimensions,
 )
@@ -12,14 +12,15 @@ class PayrollEntryOverride(PayrollEntry):
     def get_salary_components_with_project(self, component_type):
         salary_slips = self.get_sal_slip_list(ss_status=1, as_dict=True)
         if salary_slips:
+            salary_slips_names = [d.name for d in salary_slips]
+            placeholders = ", ".join(["%s"] * len(salary_slips_names))
             salary_components = frappe.db.sql(
-                """
+                f"""
                 select ssd.salary_component, ssd.amount, ssd.parentfield, ss.payroll_cost_center, ss.employee, ss.start_date, ss.end_date
                 from `tabSalary Slip` ss, `tabSalary Detail` ssd
-                where ss.name = ssd.parent and ssd.parentfield = '%s' and ss.name in (%s)
-            """
-                % (component_type, ", ".join(["%s"] * len(salary_slips))),
-                tuple([d.name for d in salary_slips]),
+                where ss.name = ssd.parent and ssd.parentfield = %s and ss.name in ({placeholders})
+            """,
+                [component_type] + salary_slips_names,
                 as_dict=True,
             )
             return self.set_employee_ammount_with_project_account_dimention(
@@ -89,7 +90,7 @@ class PayrollEntryOverride(PayrollEntry):
 
         for i in salary_slips:
             projects = None
-            employee_project = frappe.get_list(
+            employee_project = frappe.get_all(
                 "Employee Projects Payroll",
                 filters={
                     "docstatus": 1,
@@ -100,7 +101,7 @@ class PayrollEntryOverride(PayrollEntry):
                 fields=["name"],
             )
             if employee_project:
-                projects = frappe.get_list(
+                projects = frappe.get_all(
                     "Employee Project",
                     filters={"parent": employee_project[0]["name"]},
                     fields=["project", "cost_center", "percent_pay"],
@@ -118,9 +119,9 @@ class PayrollEntryOverride(PayrollEntry):
 
         return salary_slips_with_project
 
-    def make_accrual_jv_entry(self):
+    def make_accrual_jv_entry(self, submitted_salary_slips=None):
         if not self.is_project_payroll_:
-            return super().make_accrual_jv_entry()
+            return super().make_accrual_jv_entry(submitted_salary_slips)
         self.check_permission("write")
         earnings = (
             self.get_salary_component_total_with_project(component_type="earnings")
@@ -231,10 +232,15 @@ class PayrollEntryOverride(PayrollEntry):
         try:
             journal_entry.submit()
             jv_name = journal_entry.name
-            self.update_salary_slip_status(jv_name=jv_name)
+            
+            # Update salary slip status if submitted_salary_slips is provided
+            if submitted_salary_slips:
+                self.set_journal_entry_in_salary_slips(submitted_salary_slips, jv_name=jv_name)
+            else:
+                self.update_salary_slip_status(jv_name=jv_name)
         except Exception as e:
-            if type(e) in (str, list, tuple):
-                frappe.msgprint(e)
+            frappe.log_error(f"Error in make_accrual_jv_entry: {str(e)}")
+            frappe.msgprint(_("Error occurred while creating journal entry. Please check error logs."))
             raise
 
         return jv_name

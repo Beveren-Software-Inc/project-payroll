@@ -4,10 +4,9 @@
 frappe.ui.form.on('Employee Projects Payroll', {
 	refresh: function(frm) {
 		frm.set_query("cost_center", "employee_project", function() {
-			
 			return {
 				"filters": {
-					"is_group": "0",
+					"is_group": 0,
 				}
 			};
 		});

@@ -5,7 +5,7 @@ def get_data():
 		{
 			"module_name": "Project Payroll",
 			"color": "grey",
-			"icon": "octicon octicon-file-directory",
+			"icon": "folder",
 			"type": "module",
 			"label": _("Project Payroll"),
 			"items": [

@@ -12,7 +12,16 @@ class EmployeeProjectsPayroll(Document):
 
 
     def validate_dates(self):
-        employee_project = frappe.get_list("Employee Projects Payroll",filters={"docstatus": 1,"employee": self.employee,"from_date": ["<=", self.from_date],"to_date": [">=", self.to_date],},fields=["name"],)
+        employee_project = frappe.get_all(
+            "Employee Projects Payroll",
+            filters={
+                "docstatus": 1,
+                "employee": self.employee,
+                "from_date": ["<=", self.from_date],
+                "to_date": [">=", self.to_date],
+            },
+            fields=["name"],
+        )
         if employee_project:
             throw(_("there is overlaps with another Employee Projects Payroll"))
 
