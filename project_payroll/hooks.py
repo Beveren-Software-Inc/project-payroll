@@ -91,8 +91,9 @@ app_license = "MIT"
 # Override standard doctype classes
 
 override_doctype_class = {
-	"Payroll Entry": "project_payroll.project_payroll.payroll_entry.payroll.PayrollEntryOverride"
+    "Payroll Entry": "project_payroll.project_payroll.payroll_entry.payroll.PayrollEntryOverride"
 }
+
 
 # Document Events
 # ---------------
