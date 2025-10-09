@@ -1,3 +1,4 @@
+
 import frappe
 from frappe import _
 from hrms.payroll.doctype.payroll_entry.payroll_entry import PayrollEntry
@@ -9,7 +10,6 @@ from erpnext import get_company_currency
 
 
 class PayrollEntryOverride(PayrollEntry):
-
     def get_salary_components_with_project(self, component_type):
         salary_slips = self.get_sal_slip_list(ss_status=1, as_dict=True)
         if salary_slips:
@@ -20,7 +20,7 @@ class PayrollEntryOverride(PayrollEntry):
                 select ssd.salary_component, ssd.amount, ssd.parentfield, ss.employee, ss.start_date, ss.end_date
                 from `tabSalary Slip` ss, `tabSalary Detail` ssd
                 where ss.name = ssd.parent and ssd.parentfield = %s and ss.name in ({placeholders})
-                """,
+            """,
                 [component_type] + salary_slips_names,
                 as_dict=True,
             )
@@ -28,13 +28,13 @@ class PayrollEntryOverride(PayrollEntry):
                 salary_components
             )
 
-    def get_account(self, component_dict = None):
+    def get_account(self, component_dict=None):
         if not self.is_project_payroll_:
             return super().get_account()
         account_dict = {}
         for key, amount in component_dict.items():
-                account = self.get_salary_component_account(key[0])
-                account_dict[(account, key[1], key[2])] = account_dict.get((account, key[1], key[2]), 0) + amount
+            account = self.get_salary_component_account(key[0])
+            account_dict[(account, key[1], key[2])] = account_dict.get((account, key[1], key[2]), 0) + amount
         return account_dict
 
     def get_salary_component_total_with_project(self, component_type, employee_wise_accounting_enabled=False):
@@ -51,6 +51,7 @@ class PayrollEntryOverride(PayrollEntry):
                     )
                     if is_flexible_benefit == 1 and only_tax_impact == 1:
                         add_component_to_accrual_jv_entry = False
+                
                 if add_component_to_accrual_jv_entry:
                     cost_center = item.payroll_cost_center
                     if item.cost_center:
@@ -75,7 +76,6 @@ class PayrollEntryOverride(PayrollEntry):
             account_details = self.get_account(component_dict=component_dict)
             return account_details
         return {}
-
 
     def set_employee_ammount_with_project_account_dimention(self, salary_slips):
         salary_slips_with_project = []
@@ -186,242 +186,260 @@ class PayrollEntryOverride(PayrollEntry):
     def make_accrual_jv_entry(self, submitted_salary_slips=None):
         if not self.is_project_payroll_:
             return super().make_accrual_jv_entry(submitted_salary_slips)
+
         self.check_permission("write")
         
-        # Get employee-wise accounting setting from Payroll Settings
+        # Get accounting settings and data
+        employee_wise_accounting_enabled = self._get_employee_wise_accounting_setting()
+        earnings, deductions = self._get_salary_components(employee_wise_accounting_enabled)
+        
+        if not (earnings or deductions):
+            return ""
+
+        # Create journal entry
+        journal_entry = self._create_journal_entry()
+        accounts = self._build_journal_entry_accounts(
+            earnings, deductions, employee_wise_accounting_enabled
+        )
+        
+        # Submit journal entry
+        return self._submit_journal_entry(journal_entry, accounts, submitted_salary_slips)
+
+    def _get_employee_wise_accounting_setting(self):
+        """Get employee-wise accounting setting from Payroll Settings"""
         employee_wise_accounting_enabled = frappe.db.get_single_value(
             "Payroll Settings", "process_payroll_accounting_entry_based_on_employee"
         )
         
-        # Initialize employee-based payroll payable entries if enabled
         if employee_wise_accounting_enabled:
             self.employee_based_payroll_payable_entries = {}
-        
+            
+        return employee_wise_accounting_enabled
+
+    def _get_salary_components(self, employee_wise_accounting_enabled):
+        """Get earnings and deductions with project allocation"""
         earnings = self.get_salary_component_total_with_project(
             component_type="earnings", 
             employee_wise_accounting_enabled=employee_wise_accounting_enabled
         ) or {}
+        
         deductions = self.get_salary_component_total_with_project(
             component_type="deductions", 
             employee_wise_accounting_enabled=employee_wise_accounting_enabled
         ) or {}
+        
+        return earnings, deductions
 
-        payroll_payable_account = self.payroll_payable_account
-        jv_name = ""
+    def _create_journal_entry(self):
+        """Create and configure journal entry"""
+        journal_entry = frappe.new_doc("Journal Entry")
+        journal_entry.voucher_type = "Journal Entry"
+        journal_entry.user_remark = _(
+            "Accrual Journal Entry for salaries from {0} to {1}"
+        ).format(self.start_date, self.end_date)
+        journal_entry.company = self.company
+        journal_entry.posting_date = self.posting_date
+        journal_entry.title = self.payroll_payable_account
+        
+        return journal_entry
+
+    def _build_journal_entry_accounts(self, earnings, deductions, employee_wise_accounting_enabled):
+        """Build all journal entry accounts"""
+        accounts = []
+        currencies = []
+        company_currency = get_company_currency(self.company)
+        accounting_dimensions = get_accounting_dimensions() or []
         precision = frappe.get_precision("Journal Entry Account", "debit_in_account_currency")
 
-        if earnings or deductions:
-            journal_entry = frappe.new_doc("Journal Entry")
-            journal_entry.voucher_type = "Journal Entry"
-            journal_entry.user_remark = _(
-                "Accrual Journal Entry for salaries from {0} to {1}"
-            ).format(self.start_date, self.end_date)
-            journal_entry.company = self.company
-            journal_entry.posting_date = self.posting_date
-            accounting_dimensions = get_accounting_dimensions() or []
+        # Add earnings accounts
+        accounts.extend(self._build_earnings_accounts(earnings, currencies, company_currency, accounting_dimensions, precision))
+        
+        # Add deductions accounts
+        accounts.extend(self._build_deductions_accounts(deductions, currencies, company_currency, accounting_dimensions, precision))
+        
+        # Add payable accounts
+        accounts.extend(self._build_payable_accounts(employee_wise_accounting_enabled, currencies, company_currency, accounting_dimensions, precision))
 
-            accounts = []
-            currencies = []
-            company_currency = get_company_currency(self.company)
+        return accounts
 
-            # --- Earnings (Debit Expense Accounts) ---
-            for acc_cc, amount in earnings.items():
-                if len(acc_cc) == 2:
-                    acc_cc += (None,) # Handles cases without a project dimension
-                
-                (exchange_rate, amt) = self.get_amount_and_exchange_rate_for_journal_entry(
-                    acc_cc[0], amount, company_currency, currencies
-                )
-                
-                # Debit line for Earnings/Expense
-                accounts.append(
-                    self.update_accounting_dimensions(
-                        {
-                            "account": acc_cc[0],
-                            "debit_in_account_currency": flt(amt, precision),
-                            "exchange_rate": flt(exchange_rate),
-                            "cost_center": acc_cc[2] or self.cost_center,
-                            "project": acc_cc[1],
-                            "reference_type": "Payroll Entry",
-                            "reference_name": self.name,
-                            "reference_due_date": self.posting_date,
-                        },
-                        accounting_dimensions,
-                    )
-                )
-
-            # --- Deductions (Credit Deduction Liability Accounts) ---
-            for acc_cc, amount in deductions.items():
-                if len(acc_cc) == 2:
-                    acc_cc += (None,) # Handles cases without a project dimension
-                
-                (exchange_rate, amt) = self.get_amount_and_exchange_rate_for_journal_entry(
-                    acc_cc[0], amount, company_currency, currencies
-                )
-                
-                # Credit line for Deductions/Liability
-                accounts.append(
-                    self.update_accounting_dimensions(
-                        {
-                            "account": acc_cc[0],
-                            "credit_in_account_currency": flt(amt, precision),
-                            "exchange_rate": flt(exchange_rate),
-                            "cost_center": acc_cc[2] or self.cost_center,
-                            "project": acc_cc[1],
-                        },
-                        accounting_dimensions,
-                    )
-                )
-
-            # --- Payable Amount (Credit Payroll Payable Account) ---
-            if employee_wise_accounting_enabled:
-               
-                net_payables_by_employee = self.get_net_payable_per_employee()
-                
-                for employee, employee_details in self.employee_based_payroll_payable_entries.items():
-                    payable_amount = (employee_details.get("earnings", 0) or 0) - (
-                        employee_details.get("deductions", 0) or 0
-                    )
-                    
-                    if flt(payable_amount) == 0:
-                        continue
-
-                    employee_projects = self.get_employee_project_allocation(employee)
-                    
-                    if employee_projects:
-                        for project_info in employee_projects:
-                            project_payable_amount = payable_amount * (project_info["percent_pay"] / 100)
-                            
-                            if flt(project_payable_amount) == 0:
-                                continue
-                                
-                            (exchange_rate, payable_amt) = self.get_amount_and_exchange_rate_for_journal_entry(
-                                payroll_payable_account, project_payable_amount, company_currency, currencies
-                            )
-                            
-                            # Credit line for Payroll Payable Account - Employee-wise with Project
-                            accounts.append(
-                                self.update_accounting_dimensions(
-                                    {
-                                        "account": payroll_payable_account,
-                                        "credit_in_account_currency": flt(payable_amt, precision),
-                                        "exchange_rate": flt(exchange_rate),
-                                        "cost_center": project_info["cost_center"] or self.cost_center,
-                                        "project": project_info["project"],
-                                        "party_type": "Employee",
-                                        "party": employee,
-                                        "reference_type": "Payroll Entry",
-                                        "reference_name": self.name,
-                                        "reference_due_date": self.posting_date,
-                                    },
-                                    accounting_dimensions,
-                                )
-                            )
-                    else:
-                        # No project allocation - use default cost center
-                        (exchange_rate, payable_amt) = self.get_amount_and_exchange_rate_for_journal_entry(
-                            payroll_payable_account, payable_amount, company_currency, currencies
-                        )
-                        
-                        # Credit line for Payroll Payable Account - Employee-wise without Project
-                        accounts.append(
-                            self.update_accounting_dimensions(
-                                {
-                                    "account": payroll_payable_account,
-                                    "credit_in_account_currency": flt(payable_amt, precision),
-                                    "exchange_rate": flt(exchange_rate),
-                                    "cost_center": self.cost_center,
-                                    "party_type": "Employee",
-                                    "party": employee,
-                                    "reference_type": "Payroll Entry",
-                                    "reference_name": self.name,
-                                    "reference_due_date": self.posting_date,
-                                },
-                                accounting_dimensions,
-                            )
-                        )
-            else:
-                # Standard accounting: Use net payable calculation from salary slips
-                net_payables_by_employee = self.get_net_payable_per_employee()
-                
-                for employee_id, payable_amount in net_payables_by_employee.items():
-                    if flt(payable_amount) == 0:
-                        continue
-
-                    # Get project allocation for this employee
-                    employee_projects = self.get_employee_project_allocation(employee_id)
-                    
-                    if employee_projects:
-                        # Split payable amount across projects
-                        for project_info in employee_projects:
-                            project_payable_amount = payable_amount * (project_info["percent_pay"] / 100)
-                            
-                            if flt(project_payable_amount) == 0:
-                                continue
-                                
-                            (exchange_rate, payable_amt) = self.get_amount_and_exchange_rate_for_journal_entry(
-                                payroll_payable_account, project_payable_amount, company_currency, currencies
-                            )
-                            
-                            # Credit line for Payroll Payable Account - Standard accounting with Project
-                            accounts.append(
-                                self.update_accounting_dimensions(
-                                    {
-                                        "account": payroll_payable_account,
-                                        "credit_in_account_currency": flt(payable_amt, precision),
-                                        "exchange_rate": flt(exchange_rate),
-                                        "cost_center": project_info["cost_center"] or self.cost_center,
-                                        "project": project_info["project"],
-                                        "party_type": "Employee",
-                                        "party": employee_id,
-                                        "reference_type": "Payroll Entry",
-                                        "reference_name": self.name,
-                                        "reference_due_date": self.posting_date,
-                                    },
-                                    accounting_dimensions,
-                                )
-                            )
-                    else:
-                        # No project allocation - use default cost center
-                        (exchange_rate, payable_amt) = self.get_amount_and_exchange_rate_for_journal_entry(
-                            payroll_payable_account, payable_amount, company_currency, currencies
-                        )
-                        
-                        # Credit line for Payroll Payable Account - Standard accounting without Project
-                        accounts.append(
-                            self.update_accounting_dimensions(
-                                {
-                                    "account": payroll_payable_account,
-                                    "credit_in_account_currency": flt(payable_amt, precision),
-                                    "exchange_rate": flt(exchange_rate),
-                                    "cost_center": self.cost_center,
-                                    "party_type": "Employee",
-                                    "party": employee_id,
-                                    "reference_type": "Payroll Entry",
-                                    "reference_name": self.name,
-                                    "reference_due_date": self.posting_date,
-                                },
-                                accounting_dimensions,
-                            )
-                        )
-
-            # --- Finalize and Submit JV ---
-            journal_entry.set("accounts", accounts)
-            journal_entry.multi_currency = 1 if len(currencies) > 1 else 0
-            journal_entry.title = payroll_payable_account
+    def _build_earnings_accounts(self, earnings, currencies, company_currency, accounting_dimensions, precision):
+        """Build earnings (debit) accounts"""
+        accounts = []
+        
+        for acc_cc, amount in earnings.items():
+            if len(acc_cc) == 2:
+                acc_cc += (None,)  # Handle cases without project dimension
             
-            try:
-                journal_entry.insert()
-                journal_entry.submit()
-                jv_name = journal_entry.name
+            exchange_rate, amt = self.get_amount_and_exchange_rate_for_journal_entry(
+                acc_cc[0], amount, company_currency, currencies
+            )
+            
+            accounts.append(
+                self.update_accounting_dimensions(
+                    {
+                        "account": acc_cc[0],
+                        "debit_in_account_currency": flt(amt, precision),
+                        "exchange_rate": flt(exchange_rate),
+                        "cost_center": acc_cc[2] or self.cost_center,
+                        "project": acc_cc[1],
+                        "reference_type": "Payroll Entry",
+                        "reference_name": self.name,
+                        "reference_due_date": self.posting_date,
+                    },
+                    accounting_dimensions,
+                )
+            )
+        
+        return accounts
 
-                if submitted_salary_slips:
-                    self.set_journal_entry_in_salary_slips(submitted_salary_slips, jv_name=jv_name)
-                else:
-                    self.update_salary_slip_status(jv_name=jv_name)
-            except Exception as e:
-                frappe.log_error(f"Error in make_accrual_jv_entry: {str(e)}")
-                frappe.msgprint(_("Error occurred while creating journal entry. Please check error logs."))
-                raise
+    def _build_deductions_accounts(self, deductions, currencies, company_currency, accounting_dimensions, precision):
+        """Build deductions (credit) accounts"""
+        accounts = []
+        
+        for acc_cc, amount in deductions.items():
+            if len(acc_cc) == 2:
+                acc_cc += (None,)  # Handle cases without project dimension
+            
+            exchange_rate, amt = self.get_amount_and_exchange_rate_for_journal_entry(
+                acc_cc[0], amount, company_currency, currencies
+            )
+            
+            accounts.append(
+                self.update_accounting_dimensions(
+                    {
+                        "account": acc_cc[0],
+                        "credit_in_account_currency": flt(amt, precision),
+                        "exchange_rate": flt(exchange_rate),
+                        "cost_center": acc_cc[2] or self.cost_center,
+                        "project": acc_cc[1],
+                    },
+                    accounting_dimensions,
+                )
+            )
+        
+        return accounts
 
+    def _build_payable_accounts(self, employee_wise_accounting_enabled, currencies, company_currency, accounting_dimensions, precision):
+        """Build payable (credit) accounts"""
+        accounts = []
+        
+        if employee_wise_accounting_enabled:
+            accounts.extend(self._build_employee_wise_payable_accounts(currencies, company_currency, accounting_dimensions, precision))
+        else:
+            accounts.extend(self._build_standard_payable_accounts(currencies, company_currency, accounting_dimensions, precision))
+        
+        return accounts
+
+    def _build_employee_wise_payable_accounts(self, currencies, company_currency, accounting_dimensions, precision):
+        """Build employee-wise payable accounts"""
+        accounts = []
+        
+        for employee, employee_details in self.employee_based_payroll_payable_entries.items():
+            payable_amount = (employee_details.get("earnings", 0) or 0) - (
+                employee_details.get("deductions", 0) or 0
+            )
+            
+            if flt(payable_amount) == 0:
+                continue
+
+            accounts.extend(
+                self._create_employee_payable_accounts(
+                    employee, payable_amount, currencies, company_currency, accounting_dimensions, precision
+                )
+            )
+        
+        return accounts
+
+    def _build_standard_payable_accounts(self, currencies, company_currency, accounting_dimensions, precision):
+        """Build standard payable accounts"""
+        accounts = []
+        net_payables_by_employee = self.get_net_payable_per_employee()
+        
+        for employee_id, payable_amount in net_payables_by_employee.items():
+            if flt(payable_amount) == 0:
+                continue
+
+            accounts.extend(
+                self._create_employee_payable_accounts(
+                    employee_id, payable_amount, currencies, company_currency, accounting_dimensions, precision
+                )
+            )
+        
+        return accounts
+
+    def _create_employee_payable_accounts(self, employee, payable_amount, currencies, company_currency, accounting_dimensions, precision):
+        """Create payable accounts for a specific employee with project allocation"""
+        accounts = []
+        employee_projects = self.get_employee_project_allocation(employee)
+        
+        if employee_projects:
+            # Split payable amount across projects
+            for project_info in employee_projects:
+                project_payable_amount = payable_amount * (project_info["percent_pay"] / 100)
+                
+                if flt(project_payable_amount) == 0:
+                    continue
+                
+                accounts.append(
+                    self._create_payable_account_entry(
+                        employee, project_payable_amount, project_info, currencies, company_currency, accounting_dimensions, precision
+                    )
+                )
+        else:
+            # No project allocation - use default cost center
+            accounts.append(
+                self._create_payable_account_entry(
+                    employee, payable_amount, None, currencies, company_currency, accounting_dimensions, precision
+                )
+            )
+        
+        return accounts
+
+    def _create_payable_account_entry(self, employee, amount, project_info, currencies, company_currency, accounting_dimensions, precision):
+        """Create a single payable account entry"""
+        exchange_rate, payable_amt = self.get_amount_and_exchange_rate_for_journal_entry(
+            self.payroll_payable_account, amount, company_currency, currencies
+        )
+        
+        account_data = {
+            "account": self.payroll_payable_account,
+            "credit_in_account_currency": flt(payable_amt, precision),
+            "exchange_rate": flt(exchange_rate),
+            "party_type": "Employee",
+            "party": employee,
+            "reference_type": "Payroll Entry",
+            "reference_name": self.name,
+            "reference_due_date": self.posting_date,
+        }
+        
+        if project_info:
+            account_data.update({
+                "cost_center": project_info["cost_center"] or self.cost_center,
+                "project": project_info["project"],
+            })
+        else:
+            account_data["cost_center"] = self.cost_center
+        
+        return self.update_accounting_dimensions(account_data, accounting_dimensions)
+
+    def _submit_journal_entry(self, journal_entry, accounts, submitted_salary_slips):
+        """Submit the journal entry and update salary slip status"""
+        journal_entry.set("accounts", accounts)
+        journal_entry.multi_currency = 1 if len(set(acc.get("exchange_rate", 1) for acc in accounts)) > 1 else 0
+        
+        try:
+            journal_entry.insert()
+            journal_entry.submit()
+            jv_name = journal_entry.name
+
+            if submitted_salary_slips:
+                self.set_journal_entry_in_salary_slips(submitted_salary_slips, jv_name=jv_name)
+            else:
+                self.update_salary_slip_status(jv_name=jv_name)
+                
             return jv_name
+            
+        except Exception as e:
+            frappe.log_error(f"Error in make_accrual_jv_entry: {str(e)}")
+            frappe.msgprint(_("Error occurred while creating journal entry. Please check error logs."))
+            raise
