@@ -19,9 +19,12 @@ class PayrollEntryOverride(PayrollEntry):
                 f"""
                 select ssd.salary_component, ssd.amount, ssd.parentfield, ss.employee, ss.start_date, ss.end_date
                 from `tabSalary Slip` ss, `tabSalary Detail` ssd
-                where ss.name = ssd.parent and ssd.parentfield = %s and ss.name in ({placeholders})
+                where ss.name = ssd.parent 
+                and ssd.parentfield = %s 
+                and ss.name in ({placeholders})
+                and ss.payroll_entry = %s
             """,
-                [component_type] + salary_slips_names,
+                [component_type] + salary_slips_names + [self.name],
                 as_dict=True,
             )
             return self.set_employee_ammount_with_project_account_dimention(
@@ -110,7 +113,7 @@ class PayrollEntryOverride(PayrollEntry):
                     sal_slip["project"] = p["project"]
                     # If project cost center is provided, use it, otherwise use employee's default
                     sal_slip["cost_center"] = p["cost_center"] or payroll_cost_center
-                    sal_slip["payroll_cost_center"] = payroll_cost_center # Keep default cost center for reference
+                    sal_slip["payroll_cost_center"] = payroll_cost_center
                     salary_slips_with_project.append(sal_slip)
             else:
                 i["payroll_cost_center"] = payroll_cost_center
@@ -176,19 +179,135 @@ class PayrollEntryOverride(PayrollEntry):
             SELECT name, employee, net_pay
             FROM `tabSalary Slip`
             WHERE name IN ({placeholders})
+            AND payroll_entry = %s
             """,
-            sal_slip_names,
+            sal_slip_names + [self.name],
             as_dict=True,
         )
 
         return {d.employee: flt(d.net_pay) for d in net_pay_data}
+
+    def debug_salary_slips(self):
+        """Debug method to check salary slip retrieval"""
+        # Check all salary slips for this payroll entry
+        all_salary_slips = frappe.db.sql(
+            """
+            SELECT name, employee, docstatus, payroll_entry, net_pay
+            FROM `tabSalary Slip`
+            WHERE payroll_entry = %s
+            ORDER BY employee
+            """,
+            [self.name],
+            as_dict=True,
+        )
+        
+        # Check salary slips that should be submitted (docstatus = 0)
+        draft_salary_slips = frappe.db.sql(
+            """
+            SELECT name, employee, docstatus, payroll_entry, net_pay
+            FROM `tabSalary Slip`
+            WHERE payroll_entry = %s AND docstatus = 0
+            ORDER BY employee
+            """,
+            [self.name],
+            as_dict=True,
+        )
+        
+        # Check what get_sal_slip_list returns
+        hrms_salary_slips = self.get_sal_slip_list(ss_status=0, as_dict=True)
+        
+        frappe.msgprint(f"""
+        <b>Debug Information:</b><br>
+        Total Salary Slips: {len(all_salary_slips)}<br>
+        Draft Salary Slips: {len(draft_salary_slips)}<br>
+        HRMS get_sal_slip_list returns: {len(hrms_salary_slips)}<br>
+        <br>
+        <b>All Salary Slips:</b><br>
+        {', '.join([f"{ss.employee} ({ss.name}) - Status: {ss.docstatus}" for ss in all_salary_slips])}<br>
+        <br>
+        <b>Draft Salary Slips:</b><br>
+        {', '.join([f"{ss.employee} ({ss.name})" for ss in draft_salary_slips])}<br>
+        <br>
+        <b>HRMS get_sal_slip_list (ss_status=0):</b><br>
+        {', '.join([f"{ss.employee} ({ss.name})" for ss in hrms_salary_slips])}
+        """)
+
+    def debug_employee_wise_accounting(self):
+        """Debug employee-wise accounting entries"""
+        employee_wise_accounting_enabled = frappe.db.get_single_value(
+            "Payroll Settings", "process_payroll_accounting_entry_based_on_employee"
+        )
+        
+        if not employee_wise_accounting_enabled:
+            frappe.msgprint("Employee-wise accounting is DISABLED")
+            return
+            
+        # Get earnings and deductions to populate employee_based_payroll_payable_entries
+        earnings = self.get_salary_component_total_with_project(
+            component_type="earnings", 
+            employee_wise_accounting_enabled=True
+        ) or {}
+        
+        deductions = self.get_salary_component_total_with_project(
+            component_type="deductions", 
+            employee_wise_accounting_enabled=True
+        ) or {}
+        
+        frappe.msgprint(f"""
+        <b>Employee-wise Accounting Debug:</b><br>
+        Setting Enabled: {employee_wise_accounting_enabled}<br>
+        <br>
+        <b>Employee Based Payroll Payable Entries:</b><br>
+        {self.employee_based_payroll_payable_entries}<br>
+        <br>
+        <b>Earnings Total:</b> {sum(earnings.values())}<br>
+        <b>Deductions Total:</b> {sum(deductions.values())}<br>
+        <br>
+        <b>Earnings:</b><br>
+        {earnings}<br>
+        <br>
+        <b>Deductions:</b><br>
+        {deductions}
+        """)
+
+    def fix_salary_slip_payroll_entry(self):
+        """Fix salary slips that don't have payroll_entry set"""
+        # Find salary slips for this period that don't have payroll_entry set
+        salary_slips_to_fix = frappe.db.sql(
+            """
+            SELECT name, employee, start_date, end_date
+            FROM `tabSalary Slip`
+            WHERE start_date >= %s 
+            AND end_date <= %s 
+            AND (payroll_entry IS NULL OR payroll_entry = '')
+            AND docstatus = 0
+            ORDER BY employee
+            """,
+            [self.start_date, self.end_date],
+            as_dict=True,
+        )
+        
+        if salary_slips_to_fix:
+            # Update salary slips to set payroll_entry
+            for ss in salary_slips_to_fix:
+                frappe.db.set_value("Salary Slip", ss.name, "payroll_entry", self.name)
+            
+            frappe.db.commit()
+            
+            frappe.msgprint(f"""
+            <b>Fixed {len(salary_slips_to_fix)} salary slips:</b><br>
+            {', '.join([f"{ss.employee} ({ss.name})" for ss in salary_slips_to_fix])}<br>
+            <br>
+            Now try submitting salary slips again.
+            """)
+        else:
+            frappe.msgprint("No salary slips found that need fixing.")
 
     def make_accrual_jv_entry(self, submitted_salary_slips=None):
         if not self.is_project_payroll_:
             return super().make_accrual_jv_entry(submitted_salary_slips)
 
         self.check_permission("write")
-        
         # Get accounting settings and data
         employee_wise_accounting_enabled = self._get_employee_wise_accounting_setting()
         earnings, deductions = self._get_salary_components(employee_wise_accounting_enabled)
@@ -201,7 +320,6 @@ class PayrollEntryOverride(PayrollEntry):
         accounts = self._build_journal_entry_accounts(
             earnings, deductions, employee_wise_accounting_enabled
         )
-        
         # Submit journal entry
         return self._submit_journal_entry(journal_entry, accounts, submitted_salary_slips)
 
@@ -210,7 +328,7 @@ class PayrollEntryOverride(PayrollEntry):
         employee_wise_accounting_enabled = frappe.db.get_single_value(
             "Payroll Settings", "process_payroll_accounting_entry_based_on_employee"
         )
-        
+        # frappe.throw(str(employee_wise_accounting_enabled))
         if employee_wise_accounting_enabled:
             self.employee_based_payroll_payable_entries = {}
             
@@ -258,7 +376,7 @@ class PayrollEntryOverride(PayrollEntry):
         accounts.extend(self._build_deductions_accounts(deductions, currencies, company_currency, accounting_dimensions, precision))
         
         # Add payable accounts
-        accounts.extend(self._build_payable_accounts(employee_wise_accounting_enabled, currencies, company_currency, accounting_dimensions, precision))
+        accounts.extend(self._build_payable_accounts(employee_wise_accounting_enabled, currencies, company_currency, accounting_dimensions, precision, earnings, deductions))
 
         return accounts
 
@@ -319,14 +437,14 @@ class PayrollEntryOverride(PayrollEntry):
         
         return accounts
 
-    def _build_payable_accounts(self, employee_wise_accounting_enabled, currencies, company_currency, accounting_dimensions, precision):
+    def _build_payable_accounts(self, employee_wise_accounting_enabled, currencies, company_currency, accounting_dimensions, precision, earnings=None, deductions=None):
         """Build payable (credit) accounts"""
         accounts = []
         
         if employee_wise_accounting_enabled:
             accounts.extend(self._build_employee_wise_payable_accounts(currencies, company_currency, accounting_dimensions, precision))
         else:
-            accounts.extend(self._build_standard_payable_accounts(currencies, company_currency, accounting_dimensions, precision))
+            accounts.extend(self._build_standard_payable_accounts(currencies, company_currency, accounting_dimensions, precision, earnings, deductions))
         
         return accounts
 
@@ -350,20 +468,42 @@ class PayrollEntryOverride(PayrollEntry):
         
         return accounts
 
-    def _build_standard_payable_accounts(self, currencies, company_currency, accounting_dimensions, precision):
-        """Build standard payable accounts"""
+    def _build_standard_payable_accounts(self, currencies, company_currency, accounting_dimensions, precision, earnings=None, deductions=None):
+        """Build standard payable accounts - single total payable line"""
         accounts = []
-        net_payables_by_employee = self.get_net_payable_per_employee()
         
-        for employee_id, payable_amount in net_payables_by_employee.items():
-            if flt(payable_amount) == 0:
-                continue
-
-            accounts.extend(
-                self._create_employee_payable_accounts(
-                    employee_id, payable_amount, currencies, company_currency, accounting_dimensions, precision
-                )
+        # Use provided earnings and deductions, or calculate if not provided
+        if earnings is None:
+            earnings = self.get_salary_component_total_with_project(component_type="earnings") or {}
+        if deductions is None:
+            deductions = self.get_salary_component_total_with_project(component_type="deductions") or {}
+            
+        total_earnings = sum(amount for amount in earnings.values())
+        total_deductions = sum(amount for amount in deductions.values())
+        total_payable = total_earnings - total_deductions
+        
+        if flt(total_payable) == 0:
+            return accounts
+        
+        # Create single payable account entry (not split by employee)
+        exchange_rate, payable_amt = self.get_amount_and_exchange_rate_for_journal_entry(
+            self.payroll_payable_account, total_payable, company_currency, currencies
+        )
+        
+        accounts.append(
+            self.update_accounting_dimensions(
+                {
+                    "account": self.payroll_payable_account,
+                    "credit_in_account_currency": flt(payable_amt, precision),
+                    "exchange_rate": flt(exchange_rate),
+                    "cost_center": self.cost_center,
+                    "reference_type": "Payroll Entry",
+                    "reference_name": self.name,
+                    "reference_due_date": self.posting_date,
+                },
+                accounting_dimensions,
             )
+        )
         
         return accounts
 
