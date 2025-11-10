@@ -17,12 +17,26 @@ class PayrollEntryOverride(PayrollEntry):
             placeholders = ", ".join(["%s"] * len(salary_slips_names))
             salary_components = frappe.db.sql(
                 f"""
-                select ssd.salary_component, ssd.amount, ssd.parentfield, ss.employee, ss.start_date, ss.end_date
+                select
+                    ssd.salary_component,
+                    ssd.amount,
+                    ssd.parentfield,
+                    ssd.do_not_include_in_accounts,
+                    ss.employee,
+                    ss.start_date,
+                    ss.end_date
                 from `tabSalary Slip` ss, `tabSalary Detail` ssd
-                where ss.name = ssd.parent 
-                and ssd.parentfield = %s 
-                and ss.name in ({placeholders})
-                and ss.payroll_entry = %s
+                where ss.name = ssd.parent
+                    and ssd.parentfield = %s
+                    and ss.name in ({placeholders})
+                    and ss.payroll_entry = %s
+                    and (
+                        ifnull(ssd.do_not_include_in_total, 0) = 0
+                        or (
+                            ifnull(ssd.do_not_include_in_total, 0) = 1
+                            and ifnull(ssd.do_not_include_in_accounts, 0) = 0
+                        )
+                    )
             """,
                 [component_type] + salary_slips_names + [self.name],
                 as_dict=True,
@@ -61,21 +75,17 @@ class PayrollEntryOverride(PayrollEntry):
                         cost_center = item.cost_center
 
                     if item.project:
-                        # Key: (Salary Component, Project, Cost Center)
                         key = (item.salary_component, item.project, cost_center)
                     else:
-                        # Key: (Salary Component, None, Cost Center)
                         key = (item.salary_component, None, cost_center)
 
                     component_dict[key] = component_dict.get(key, 0) + flt(item.amount)
                     
-                    # Track employee-wise accounting if enabled
                     if employee_wise_accounting_enabled:
                         self.set_employee_based_payroll_payable_entries(
                             component_type, item["employee"], flt(item.amount)
                         )
 
-            # Result account_details keys: (Account, Project, Cost Center)
             account_details = self.get_account(component_dict=component_dict)
             return account_details
         return {}
@@ -111,13 +121,12 @@ class PayrollEntryOverride(PayrollEntry):
                     sal_slip = i.copy()
                     sal_slip["amount"] = amount * (p["percent_pay"] / 100)
                     sal_slip["project"] = p["project"]
-                    # If project cost center is provided, use it, otherwise use employee's default
                     sal_slip["cost_center"] = p["cost_center"] or payroll_cost_center
                     sal_slip["payroll_cost_center"] = payroll_cost_center
                     salary_slips_with_project.append(sal_slip)
             else:
                 i["payroll_cost_center"] = payroll_cost_center
-                i["cost_center"] = payroll_cost_center # Assign default cost center if not already present
+                i["cost_center"] = payroll_cost_center
                 i["project"] = None
                 salary_slips_with_project.append(i)
 
@@ -316,7 +325,7 @@ class PayrollEntryOverride(PayrollEntry):
             return ""
 
         # Create journal entry
-        journal_entry = self._create_journal_entry()
+        journal_entry = self._create_journal_entry(employee_wise_accounting_enabled)
         accounts = self._build_journal_entry_accounts(
             earnings, deductions, employee_wise_accounting_enabled
         )
@@ -348,7 +357,7 @@ class PayrollEntryOverride(PayrollEntry):
         
         return earnings, deductions
 
-    def _create_journal_entry(self):
+    def _create_journal_entry(self, employee_wise_accounting_enabled):
         """Create and configure journal entry"""
         journal_entry = frappe.new_doc("Journal Entry")
         journal_entry.voucher_type = "Journal Entry"
@@ -358,6 +367,9 @@ class PayrollEntryOverride(PayrollEntry):
         journal_entry.company = self.company
         journal_entry.posting_date = self.posting_date
         journal_entry.title = self.payroll_payable_account
+        # Set party_not_required flag to skip party validation when employee-wise accounting is disabled
+        # This matches HRMS behavior - when employee-wise is disabled, party is not required
+        journal_entry.party_not_required = True if not employee_wise_accounting_enabled else False
         
         return journal_entry
 
@@ -386,7 +398,7 @@ class PayrollEntryOverride(PayrollEntry):
         
         for acc_cc, amount in earnings.items():
             if len(acc_cc) == 2:
-                acc_cc += (None,)  # Handle cases without project dimension
+                acc_cc += (None,)  
             
             exchange_rate, amt = self.get_amount_and_exchange_rate_for_journal_entry(
                 acc_cc[0], amount, company_currency, currencies
@@ -416,7 +428,7 @@ class PayrollEntryOverride(PayrollEntry):
         
         for acc_cc, amount in deductions.items():
             if len(acc_cc) == 2:
-                acc_cc += (None,)  # Handle cases without project dimension
+                acc_cc += (None,)  
             
             exchange_rate, amt = self.get_amount_and_exchange_rate_for_journal_entry(
                 acc_cc[0], amount, company_currency, currencies
@@ -508,30 +520,16 @@ class PayrollEntryOverride(PayrollEntry):
         return accounts
 
     def _create_employee_payable_accounts(self, employee, payable_amount, currencies, company_currency, accounting_dimensions, precision):
-        """Create payable accounts for a specific employee with project allocation"""
+        """Create payable accounts for a specific employee - one line per employee with total amount"""
         accounts = []
-        employee_projects = self.get_employee_project_allocation(employee)
         
-        if employee_projects:
-            # Split payable amount across projects
-            for project_info in employee_projects:
-                project_payable_amount = payable_amount * (project_info["percent_pay"] / 100)
-                
-                if flt(project_payable_amount) == 0:
-                    continue
-                
-                accounts.append(
-                    self._create_payable_account_entry(
-                        employee, project_payable_amount, project_info, currencies, company_currency, accounting_dimensions, precision
-                    )
-                )
-        else:
-            # No project allocation - use default cost center
-            accounts.append(
-                self._create_payable_account_entry(
-                    employee, payable_amount, None, currencies, company_currency, accounting_dimensions, precision
-                )
+        # For employee-wise accounting, create ONE payable line per employee with total amount
+        # The project allocation is handled in the earnings/deductions (debit) side
+        accounts.append(
+            self._create_payable_account_entry(
+                employee, payable_amount, None, currencies, company_currency, accounting_dimensions, precision
             )
+        )
         
         return accounts
 
@@ -550,15 +548,16 @@ class PayrollEntryOverride(PayrollEntry):
             "reference_type": "Payroll Entry",
             "reference_name": self.name,
             "reference_due_date": self.posting_date,
+            "cost_center": self.cost_center,  
         }
         
+        # Only add project dimension if project_info is provided
+        # For employee-wise accounting, we don't split payable by project
         if project_info:
             account_data.update({
                 "cost_center": project_info["cost_center"] or self.cost_center,
                 "project": project_info["project"],
             })
-        else:
-            account_data["cost_center"] = self.cost_center
         
         return self.update_accounting_dimensions(account_data, accounting_dimensions)
 
