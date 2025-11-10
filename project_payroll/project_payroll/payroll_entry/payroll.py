@@ -17,12 +17,26 @@ class PayrollEntryOverride(PayrollEntry):
             placeholders = ", ".join(["%s"] * len(salary_slips_names))
             salary_components = frappe.db.sql(
                 f"""
-                select ssd.salary_component, ssd.amount, ssd.parentfield, ss.employee, ss.start_date, ss.end_date
+                select
+                    ssd.salary_component,
+                    ssd.amount,
+                    ssd.parentfield,
+                    ssd.do_not_include_in_accounts,
+                    ss.employee,
+                    ss.start_date,
+                    ss.end_date
                 from `tabSalary Slip` ss, `tabSalary Detail` ssd
-                where ss.name = ssd.parent 
-                and ssd.parentfield = %s 
-                and ss.name in ({placeholders})
-                and ss.payroll_entry = %s
+                where ss.name = ssd.parent
+                    and ssd.parentfield = %s
+                    and ss.name in ({placeholders})
+                    and ss.payroll_entry = %s
+                    and (
+                        ifnull(ssd.do_not_include_in_total, 0) = 0
+                        or (
+                            ifnull(ssd.do_not_include_in_total, 0) = 1
+                            and ifnull(ssd.do_not_include_in_accounts, 0) = 0
+                        )
+                    )
             """,
                 [component_type] + salary_slips_names + [self.name],
                 as_dict=True,
@@ -311,7 +325,7 @@ class PayrollEntryOverride(PayrollEntry):
             return ""
 
         # Create journal entry
-        journal_entry = self._create_journal_entry()
+        journal_entry = self._create_journal_entry(employee_wise_accounting_enabled)
         accounts = self._build_journal_entry_accounts(
             earnings, deductions, employee_wise_accounting_enabled
         )
@@ -343,7 +357,7 @@ class PayrollEntryOverride(PayrollEntry):
         
         return earnings, deductions
 
-    def _create_journal_entry(self):
+    def _create_journal_entry(self, employee_wise_accounting_enabled):
         """Create and configure journal entry"""
         journal_entry = frappe.new_doc("Journal Entry")
         journal_entry.voucher_type = "Journal Entry"
@@ -353,6 +367,9 @@ class PayrollEntryOverride(PayrollEntry):
         journal_entry.company = self.company
         journal_entry.posting_date = self.posting_date
         journal_entry.title = self.payroll_payable_account
+        # Set party_not_required flag to skip party validation when employee-wise accounting is disabled
+        # This matches HRMS behavior - when employee-wise is disabled, party is not required
+        journal_entry.party_not_required = True if not employee_wise_accounting_enabled else False
         
         return journal_entry
 
